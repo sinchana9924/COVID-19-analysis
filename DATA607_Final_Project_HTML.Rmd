@@ -1,0 +1,308 @@
+---
+title: 'DATA607: Final Project'
+author: "Sinchana Gupta Garla Venkatesha"
+date: "2024-12-06"
+output: html_document
+---
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = FALSE)
+library(COVID19)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(cluster)
+library(caret)
+library(xgboost)
+library(pROC)
+library(gridExtra)
+library(boot)
+library(patchwork)
+```
+
+# Understanding COVID-19 Case Fatality Rates: A Data-Driven Approach
+
+## Introduction
+
+The COVID-19 pandemic has disrupted lives globally, with Case Fatality Rate (CFR) emerging as a key measure of severity. CFR, calculated as the ratio of deaths to confirmed cases, varies significantly across regions due to factors such as testing rates, vaccination policies, and government responses.
+
+### Objectives
+**Primary Goal**: Identify the drivers of high CFR (CFR > 3%) and classify high-risk regions using machine learning.
+**Secondary Goals**: 
+(i) Analyze the relationships between government policies, testing, and CFR. (ii) Examine regional disparities and trends over time.
+
+## Step-1: Data Collection and Preparation
+
+The dataset, sourced from the COVID19 R package, provides detailed information on COVID-19 cases, deaths, testing, and policies at a regional level. To ensure reliability, the following data cleaning steps were applied:
+
+(i) **Grouping by Region**: Countries were categorized into major regions (Americas, Asia, Europe, Other) for comparative analysis.
+(ii) **Handling Missing Values**: Numerical values were imputed with medians, and categorical variables with "Unknown".
+(iii) **Derived Metrics**: Tests_Per_Capita was calculated as tests / population to standardize testing data across regions.
+
+```{r echo=TRUE}
+# Data preparation steps
+df <- covid19(level = 2) %>%
+  mutate(
+    state = administrative_area_level_2,
+    region = case_when(
+      administrative_area_level_1 %in% c("United States", "Canada", "Mexico", "Brazil", "Argentina") ~ "Americas",
+      administrative_area_level_1 %in% c("China", "India", "Japan", "Thailand") ~ "Asia",
+      administrative_area_level_1 %in% c("France", "Germany", "Italy", "Spain") ~ "Europe",
+      TRUE ~ "Other"
+    ),
+    Tests_Per_Capita = tests / population
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)),
+         across(where(is.character), ~ ifelse(is.na(.), "Unknown", .)))
+```
+
+## Step-2: Exploratory Data Analysis (EDA)
+
+#### CFR Trends Over Time
+
+```{r echo=TRUE}
+# Visualizing CFR trends by region
+df <- df %>% mutate(CFR = ifelse(confirmed > 0, (deaths / confirmed) * 100, NA))
+
+df %>%
+  group_by(region, date) %>%
+  summarise(mean_CFR = mean(CFR, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = mean_CFR, color = region)) +
+  geom_line(size = 1) +
+  labs(title = "CFR Trends Over Time by Region", x = "Date", y = "Mean CFR (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r echo=TRUE}
+df %>%
+  group_by(region, date) %>%
+  summarise(mean_CFR = mean(CFR, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = mean_CFR, color = region)) +
+  geom_line(size = 1) +
+  labs(title = "CFR Trends Over Time by Region", x = "Date", y = "Mean CFR (%)") +
+  facet_wrap(~region, scales = "free_y") +  # Separate panels by region
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 12)  # Adjust facet labels
+  )
+```
+
+**Insights:** Europe and the Americas show sharp CFR peaks, reflecting healthcare system strains during surges.
+
+#### Relationship Between Tests and CFR
+
+```{r echo=TRUE}
+# Improve readability of the CFR vs. Tests Per Capita plot
+df %>%
+  ggplot(aes(x = Tests_Per_Capita, y = CFR)) +
+  geom_point(alpha = 0.4, size = 1.5, color = "blue") +  # Add transparency and color
+  geom_smooth(method = "lm", color = "red", size = 1) +  # Thicker regression line
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +  # Set y-axis limits and ticks
+  scale_x_continuous(limits = c(0, 40), breaks = seq(0, 40, 5)) +  # Set x-axis limits and ticks
+  labs(
+    title = "Relationship Between Tests Per Capita and CFR",
+    x = "Tests Per Capita",
+    y = "CFR (%)"
+  ) +
+  theme_minimal(base_size = 14) +  # Increase base font size
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),  # Bold, centered title
+    axis.title = element_text(size = 14),  # Larger axis labels
+    axis.text = element_text(size = 12)  # Larger tick labels
+  )
+```
+
+**Observation:** A negative correlation suggests that increased testing helps reduce CFR by enabling early detection.
+
+#### Regional Disparities in CFR
+
+```{r echo=TRUE}
+# CFR distribution by region
+df %>%
+  ggplot(aes(x = region, y = CFR, fill = region)) +
+  geom_boxplot(outlier.color = "red", outlier.size = 2) +
+  labs(title = "Distribution of CFR by Region", x = "Region", y = "CFR (%)") +
+  theme_minimal()
+```
+
+**Conclusion:** Wide variations in CFR across regions highlight healthcare disparities.
+
+#### Correlation Between Predictors (Heatmap)
+
+**Aim:** Highlight how different features (e.g., testing rates, government policies) correlate with CFR.
+
+```{r echo=TRUE}
+cor_data <- df %>%
+  select(CFR, Tests_Per_Capita, vaccination_policy, government_response_index) %>%
+  cor(use = "complete.obs")
+
+melted_cor <- melt(cor_data)
+
+ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") + 
+  # Add white grid lines
+  scale_fill_viridis_c() +
+  labs(
+    title = "Correlation Matrix",
+    x = "Variables",
+    y = "Variables",
+    fill = "Correlation"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), 
+    # Rotate x-axis labels
+    axis.text.y = element_text(size = 12), 
+    # Increase y-axis label size
+    legend.title = element_text(size = 12), 
+    # Adjust legend title size
+    legend.text = element_text(size = 10) 
+    # Adjust legend text size
+  )
+```
+
+## Step 3: Analytical Insights
+
+#### Clustering Analysis
+
+Regions were grouped into clusters based on CFR, Tests_Per_Capita, population, and government response index.
+
+```{r echo=TRUE}
+# Ensure valid rows are identified for clustering
+valid_rows <- complete.cases(df[, c("CFR", "Tests_Per_Capita", "population", "government_response_index")])
+
+# K-means clustering
+clustering_data <- scale(df[valid_rows, c("CFR", "Tests_Per_Capita", "population", "government_response_index")])
+set.seed(42)
+kmeans_result <- kmeans(clustering_data, centers = 3)
+df$cluster <- factor(ifelse(valid_rows, kmeans_result$cluster, NA))
+
+# Define colors for clusters
+cluster_colors <- c("1" = "#E41A1C", "2" = "#377EB8", "3" = "#4DAF4A")
+
+# Plot for Cluster 1
+plot1 <- ggplot(df %>% filter(cluster == "1"), aes(x = Tests_Per_Capita, y = CFR)) +
+  geom_point(color = cluster_colors["1"], alpha = 0.5, size = 1) +
+  labs(title = "Cluster 1: High CFR, Low Testing", x = "Tests Per Capita", y = "CFR (%)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# Plot for Cluster 2
+plot2 <- ggplot(df %>% filter(cluster == "2"), aes(x = Tests_Per_Capita, y = CFR)) +
+  geom_point(color = cluster_colors["2"], alpha = 0.5, size = 1) +
+  labs(title = "Cluster 2: Moderate CFR and Testing", x = "Tests Per Capita", y = "CFR (%)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# Plot for Cluster 3
+plot3 <- ggplot(df %>% filter(cluster == "3"), aes(x = Tests_Per_Capita, y = CFR)) +
+  geom_point(color = cluster_colors["3"], alpha = 0.5, size = 1) +
+  labs(title = "Cluster 3: Low CFR, High Testing", x = "Tests Per Capita", y = "CFR (%)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# Arrange the plots vertically
+grid.arrange(plot1, plot2, plot3, ncol = 1)
+```
+
+**Key Findings:**
+
+- Cluster 1: High CFR and low testing rates.
+- Cluster 2: Moderate CFR with higher testing.
+- Cluster 3: Low CFR and robust testing.
+
+#### Regression Analysis
+
+To identify the drivers of CFR, a multivariate regression model was fitted:
+
+```{r echo=TRUE}
+regression_model <- lm(CFR ~ Tests_Per_Capita + vaccination_policy + government_response_index + population, data = df)
+summary(regression_model)
+```
+
+**Key Results:**
+
+(i) Tests_Per_Capita: Strong negative association with CFR.
+(ii) Vaccination Policy: Significant in reducing CFR.
+
+#### Classification of High-Risk Regions
+
+Regions with CFR > 3% were classified as high-risk using XGBoost.
+
+```{r echo=TRUE}
+# XGBoost Classification
+df_clean <- df %>%
+  mutate(high_risk = ifelse(CFR > 3, 1, 0)) %>%
+  filter(!is.na(high_risk), !is.na(Tests_Per_Capita), !is.na(vaccination_policy), !is.na(government_response_index))
+
+train_index <- createDataPartition(df_clean$high_risk, p = 0.8, list = FALSE)
+train_data <- df_clean[train_index, ]
+test_data <- df_clean[-train_index, ]
+
+train_matrix <- as.matrix(train_data[, c("Tests_Per_Capita", "vaccination_policy", "government_response_index")])
+test_matrix <- as.matrix(test_data[, c("Tests_Per_Capita", "vaccination_policy", "government_response_index")])
+
+xgb_model <- xgboost(data = train_matrix, label = train_data$high_risk, nrounds = 100, objective = "binary:logistic", verbose = 0)
+
+# Evaluate
+xgb_predictions <- predict(xgb_model, test_matrix)
+confusionMatrix(as.factor(ifelse(xgb_predictions > 0.5, 1, 0)), as.factor(test_data$high_risk))
+```
+
+**Performance:**
+
+(i) Accuracy: ~90%
+(ii) Sensitivity: ~97%
+(iii) Specificity: ~67%
+
+## Step 4: Measurements of Uncertainty
+
+#### Confidence Intervals for Tests_Per_Capita
+
+```{r echo=TRUE, out.width = "65%", fig.align = "center"}
+ci_tests <- df %>%
+  group_by(region) %>%
+  summarise(
+    Mean_Tests_Per_Capita = mean(Tests_Per_Capita, na.rm = TRUE),
+    SD = sd(Tests_Per_Capita, na.rm = TRUE),
+    N = n(),
+    CI_Lower = Mean_Tests_Per_Capita - qt(0.975, N - 1) * (SD / sqrt(N)),
+    CI_Upper = Mean_Tests_Per_Capita + qt(0.975, N - 1) * (SD / sqrt(N))
+  )
+
+# Plot with confidence intervals
+ggplot(ci_tests, aes(x = region, y = Mean_Tests_Per_Capita)) +
+  geom_point(size = 4, color = "blue") +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2, color = "darkgray") +
+  labs(title = "Mean Tests Per Capita with Confidence Intervals by Region",
+       x = "Region", y = "Mean Tests Per Capita") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) + # Add space above and below the plot
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.title = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12), # Rotate x-axis labels
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+## Conclusions and Recommendations
+
+#### Key Insights:
+
+(i) Increased testing reduces CFR by enabling early case detection.
+Strong vaccination policies correlate with lower CFR.
+(ii) Regions with low testing and weak policies form high-risk clusters.
+
+#### Recommendations:
+(i) Expand testing infrastructure in underperforming regions.
+(ii) Invest in vaccination campaigns.
+(iii) Tailor government responses to regional needs.
+
+#### Future Directions:
+- Incorporate additional factors like healthcare capacity and demographics.
+Extend analysis to finer-grained data for localized insights.
